@@ -30,6 +30,8 @@ For comparison, the table below shows the efficiency of other solvers. Some solv
 |    h48h7         |  3793 MB   |             1.1        |
 | vcube coord=112  |  2603 MB   |       7.5 / 1.3        |
 |    nxopt31       |  2603 MB   |      11.4 / 1.5        |
+|  Cube Explorer   |  1972 MB   |      28.2 / 3.5        |
+|    3ColorCube    |  2959 MB   |             4.2        |
 
 ## usage
 
