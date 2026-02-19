@@ -1,0 +1,317 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+
+<head>
+	<meta charset="utf-8" />
+	<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<meta name="format-detection" content="telephone=no" />
+	<meta name="mobile-web-app-capable" content="yes" />
+	<link rel="icon" href="data:image/png;base64,iVBORw0KGgo=">
+	<link href="css/bootstrap462.css" rel="stylesheet" />
+	<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+	<title>Cubeopt Demo</title>
+	<script type="text/javascript" src="js/jquery351.min.js"></script>
+	<script type="text/javascript" src="js/bootstrap462.min.js"></script>
+	<script type="text/javascript">
+
+		let is_busy = false;
+		let ret_code = 1;
+		let cur_solver = null;
+
+		const worker = new Worker('wasm-worker.js');
+
+		worker.onmessage = (e) => {
+			e = e.data;
+			if (e.code == -1) { // log
+				$('#logs').val($('#logs').val() + e.data.trim() + '\n').scrollTop($('#logs')[0].scrollHeight);
+				console.log('[wasm log]', e.data.trim());
+				let m = /handled (\d+)%,/.exec(e.data.trim());
+				if (m) {
+					$('#busyProgress').show();
+					$('#busyProgressBar').css('width', m[1] + '%');
+				}
+				return;
+			} else if (e.code == -2) { // progress
+				$('#busyProgress').show();
+				$('#busyProgressBar').css('width', e.data * 100 + '%');
+				return;
+			}
+			if (e.code < 3) {
+				ret_code = e.code;
+				if (ret_code == 1) {
+					cur_solver = null;
+				}
+			}
+			if (e.cmd == 'select solver') {
+				if (e.code != 1) {
+					cur_solver = {
+						name: e.solver,
+						table_name: e.table_name,
+						table_size: Number(e.table_size)
+					};
+					$('#tableSize').text(solvers[e.solver][1]);
+					$('#prun_table_name').text(e.table_name);
+				}
+			} else if (e.cmd == 'download table') {
+				if (e.code == 0) {
+					const data = new Uint8Array(e.data);
+					const blob = new Blob([data], { type: 'application/octet-stream' });
+					const url = URL.createObjectURL(blob);
+					const a = document.createElement('a');
+					a.href = url;
+					a.download = cur_solver.table_name;
+					document.body.appendChild(a);
+					a.click();
+					document.body.removeChild(a);
+					URL.revokeObjectURL(url);
+				}
+			} else if (e.cmd == 'upload table') {
+				if (e.code != 0) {
+					alert('Incorrect table data');
+				}
+			}
+			toggle_buttons(false);
+		}
+
+		const solvers = {
+			"cube48opt1": ["./cube48opt1.mjs", "30.4M"],
+			"cube48opt2": ["./cube48opt2.mjs", "121M"],
+			"cube48opt3": ["./cube48opt3.mjs", "243M"],
+			"cube48opt4": ["./cube48opt4.mjs", "486M"],
+			"cube48opt5": ["./cube48opt5.mjs", "972M"],
+			"cube48opt6": ["./cube48opt6.mjs", "1945M"],
+			"cube48opt7": ["./cube48opt7.mjs", "3891M"],
+		};
+
+		function toggle_buttons(_is_busy) {
+			is_busy = _is_busy;
+			$('#solver').prop('disabled', is_busy);
+
+			if (is_busy || ret_code == 1) { // deployed error or busy
+				$('#genTables').prop('disabled', true);
+				$('#downloadTables').prop('disabled', true).hide();
+				$('#uploadTables').prop('disabled', true).show();
+				$('#startSolve').prop('disabled', true);
+			} else if (ret_code == 2) { // not initialized
+				$('#genTables').prop('disabled', false);
+				$('#downloadTables').prop('disabled', true).hide();
+				$('#uploadTables').prop('disabled', false).show();
+				$('#startSolve').prop('disabled', true);
+				$('#busyProgress').hide();
+			} else { // initialized
+				$('#genTables').prop('disabled', true);
+				$('#downloadTables').prop('disabled', false).show();
+				$('#uploadTables').prop('disabled', true).hide();
+				$('#startSolve').prop('disabled', false);
+				$('#busyProgress').hide();
+			}
+		}
+
+		function generate_table() {
+			if (is_busy) {
+				return;
+			}
+			toggle_buttons(true);
+			worker.postMessage({ cmd: 'generate table' });
+		}
+
+		function download_table() {
+			if (is_busy) {
+				return;
+			}
+			toggle_buttons(true);
+			if (window.showSaveFilePicker) {
+				window.showSaveFilePicker({
+					suggestedName: cur_solver.table_name
+				}).then((file) => {
+					if (file.name != cur_solver.table_name) {
+						alert('file name not match, expect ' + cur_solver.table_name);
+						return Promise.reject();
+					}
+					worker.postMessage({ cmd: 'download table fileapi', data: file });
+				}).catch((e) => {
+					toggle_buttons(false);
+				});
+			} else {
+				worker.postMessage({ cmd: 'download table' });
+			}
+		}
+
+		function start_solve() {
+			if (is_busy) {
+				return;
+			}
+			let scrambles = $('#scramble').val().split('\n').map((s) => s.trim());
+			scrambles = scrambles.filter((s) => s.length > 0).join('\n');
+			$('#scramble').val(scrambles);
+			if (scrambles.length == 0) {
+				alert('No scrambles');
+				return;
+			}
+			toggle_buttons(true);
+			worker.postMessage({
+				cmd: 'start solve',
+				scramble: $('#scramble').val(),
+				n_threads: ~~$('#n_threads').val(),
+				n_group: ~~$('#n_group').val(),
+				debug: location.href.indexOf('debug=1') != -1 ? 2 : 1
+			});
+		}
+
+		function change_solver(e) {
+			if (is_busy) {
+				return;
+			}
+			toggle_buttons(true);
+			worker.postMessage({ cmd: 'select solver', data: this.value });
+		}
+
+		function upload_table() {
+			if (is_busy || ret_code == 1) {
+				return;
+			}
+			let file = $('#tableFile')[0].files[0];
+			if (!file) {
+				return;
+			}
+			if (file.name != cur_solver.table_name) {
+				alert('file name not match, expect ' + cur_solver.table_name);
+				return;
+			}
+			toggle_buttons(true);
+			worker.postMessage({ cmd: 'upload table', data: file });
+		}
+
+		function randomMove(len) {
+			let moves = [];
+			for (var i1 = 0; i1 < len; i1++) {
+				let move = ~~(Math.random() * 18);
+				if (moves.length > 0 && ~~(move / 3) == ~~(moves.at(-1) / 3)) {
+					i1 -= 1;
+					continue;
+				} else if (moves.length > 1 && ~~(move / 3) % 3 == ~~(moves.at(-1) / 3) % 3 && ~~(move / 3) == ~~(moves.at(-2) / 3)) {
+					i1 -= 1;
+					continue;
+				}
+				moves.push(move);
+			}
+			return moves.map(m => 'URFDLB'.charAt(~~(m / 3)) + ['', '2', "'"][m % 3]).join(' ');
+		}
+
+		$(() => {
+			$('#solver').change(change_solver);
+			$('#genTables').click(generate_table);
+			$('#downloadTables').click(download_table);
+			$('#uploadTables').click(() => $('#tableFile').click());
+			$('#tableFile').change(upload_table);
+			$('#startSolve').click(start_solve);
+			$('#solver').trigger('change');
+			$('#genRnd').click(() => {
+				let scrambles = [];
+				let scrNum = $('#scrNum').val();
+				let scrLen = $('#scrLen').val();
+				for (let i = 0; i < scrNum; i++) {
+					scrambles.push(randomMove(scrLen));
+				}
+				$('#scramble').val(scrambles.join('\n'));
+			});
+			$('#n_threads').empty();
+			for (let i = 1; i <= navigator.hardwareConcurrency; i++) {
+				$('#n_threads').append('<option value="' + i + '">' + i + '</option>');
+			}
+			$('#n_threads').change(() => {
+				$('#n_group').empty();
+				let n_threads = ~~($('#n_threads').val());
+				for (let i = 1; i <= n_threads; i++) {
+					if (n_threads % i == 0) {
+						$('#n_group').append('<option value="' + i + '">' + i + '</option>');
+					}
+				}
+				$('#n_group').val(1);
+			});
+			$('#n_threads').val(navigator.hardwareConcurrency).trigger('change');
+		});
+
+	</script>
+</head>
+
+<body>
+	<div class="container">
+		<div class="card">
+			<div class="card-header">Cubeopt Solver</div>
+			<div class="card-body">
+				<div class="input-group">
+					<div class="input-group-prepend">
+						<span class="input-group-text">Solver</span>
+					</div>
+					<select class="custom-select" id="solver">
+						<option value="cube48opt1">cube48opt1</option>
+						<option value="cube48opt2">cube48opt2</option>
+						<option value="cube48opt3" selected>cube48opt3</option>
+						<option value="cube48opt4">cube48opt4</option>
+						<option value="cube48opt5">cube48opt5</option>
+						<option value="cube48opt6">cube48opt6</option>
+						<option value="cube48opt7">cube48opt7</option>
+					</select>
+					<div class="input-group-append">
+						<span class="input-group-text" id="tableSize">-</span>
+					</div>
+				</div>
+				<div class="input-group">
+					<div class="input-group-prepend form-control" id="prun_table_name"> Not Ready </div>
+					<button class="btn btn-primary" id="genTables">Generate Table</button>
+					<button class="btn btn-primary" id="downloadTables">Download Table</button>
+					<button class="btn btn-primary" id="uploadTables">Upload Table</button>
+				</div>
+				<input type="file" id="tableFile" style="display: none;" />
+				<div class="progress" id="busyProgress" style="display: none;">
+					<div class="progress-bar progress-bar-striped" role="progressbar" style="width: 10%" aria-valuenow="10" aria-valuemin="0" aria-valuemax="100" id="busyProgressBar"></div>
+				</div>
+				<div class="input-group mt-2">
+					<div class="input-group-prepend">
+						<span class="input-group-text">Scrambles</span>
+					</div>
+					<select class="custom-select" id="scrLen">
+						<option value="15" selected>15 moves</option>
+						<option value="16">16 moves</option>
+						<option value="17">17 moves</option>
+						<option value="18">18 moves</option>
+						<option value="19">19 moves</option>
+						<option value="20">20 moves</option>
+						<option value="25">25 moves</option>
+						<option value="30">30 moves</option>
+					</select>
+					<select class="custom-select" id="scrNum">
+						<option value="1">1 cube</option>
+						<option value="5">5 cubes</option>
+						<option value="10" selected>10 cubes</option>
+						<option value="20">20 cubes</option>
+						<option value="50">50 cubes</option>
+						<option value="100">100 cubes</option>
+					</select>
+					<button class="btn btn-primary" id="genRnd">Random</button>
+				</div>
+				<textarea class="form-control" id="scramble" rows="3"></textarea>
+				<div class="input-group mt-2">
+					<div class="input-group-prepend">
+						<span class="input-group-text">Threads</span>
+					</div>
+					<select class="custom-select" id="n_threads"></select>
+					<div class="input-group-prepend">
+						<span class="input-group-text">Concurrent Cubes</span>
+					</div>
+					<select class="custom-select" id="n_group"></select>
+					<button class="btn btn-primary" id="startSolve">Solve</button>
+				</div>
+				<div class="input-group">
+					<div class="input-group-prepend">
+						<span class="input-group-text">Logs</span>
+					</div>
+					<textarea class="form-control" id="logs" rows="10" wrap="off" style="font-family: monospace"></textarea>
+				</div>
+			</div>
+		</div>
+	</div>
+</body>
+</html>
