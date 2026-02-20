@@ -11,7 +11,7 @@ cubeopt is a series of fast optimal solvers for Rubik's Cube in half-turn metric
 
 The cube48opt series uses IDA* algorithm to solve Rubik's Cube. The difference between them lies in the size of pruning table (pattern database). Quantitative analysis shows that solving efficiency is approximately proportional to the size of pruning table; that is, doubling the size of pruning table halves the solving time.
 
-This project includes 7 solvers, and their pruning table sizes and solving efficiencies are shown in the table below. (Please note that time-related data is heavily dependent on the environment.)
+This project includes 9 solvers, and their pruning table sizes and solving efficiencies are shown in the table below. (Please note that time-related data is heavily dependent on the environment.)
 
 | Variations | Table Size | Seconds per cube |
 |:----------:|:----------:|:----------------:|
@@ -22,6 +22,8 @@ This project includes 7 solvers, and their pruning table sizes and solving effic
 | cube48opt5 |   972 MB   |       2.4        |
 | cube48opt6 |  1945 MB   |       1.2        |
 | cube48opt7 |  3891 MB   |       0.6        |
+| cube48opt8 |  7782 MB   |       0.4        |
+| cube48opt9 | 15565 MB   |       0.2        |
 
 For comparison, the table below shows the efficiency of other solvers. Some solvers do not support multi-threading for solving a single cube, in this case, the second number in the table represents the throughput-converted efficiency (i.e., the equivalent solving time per cube after concurrently solving multiple cubes).
 

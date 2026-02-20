@@ -7,6 +7,8 @@ const solvers = {
 	"cube48opt5": ["./cube48opt5.mjs", "972M"],
 	"cube48opt6": ["./cube48opt6.mjs", "1945M"],
 	"cube48opt7": ["./cube48opt7.mjs", "3891M"],
+	"cube48opt8": ["./cube48opt8.mjs", "7782M"],
+	"cube48opt9": ["./cube48opt9.mjs", "15565M"],
 };
 var cur_solver = null;
 var cur_solver_name = null;
@@ -16,7 +18,7 @@ function solver_check(e, check_init = true) {
 		self.postMessage(Object.assign({}, e, { code: 1 }));
 		return true;
 	}
-	if (check_init && cur_solver.init(-1) == 1) {
+	if (check_init && cur_solver.init(-1, 1) == 1) {
 		self.postMessage(Object.assign({}, e, { code: 2 }));
 		return true;
 	}
@@ -27,7 +29,7 @@ function generate_table(e) {
 	if (solver_check(e, false)) {
 		return;
 	}
-	cur_solver.init(self.navigator.hardwareConcurrency);
+	cur_solver.init(self.navigator.hardwareConcurrency, navigator.hardwareConcurrency);
 	self.postMessage(Object.assign({}, e, { code: 0 }));
 }
 
@@ -92,7 +94,7 @@ function change_solver(e) {
 		cur_solver = solver;
 		cur_solver_name = solver_name;
 		self.postMessage(Object.assign({}, e, {
-			code: cur_solver.init(-1) == 0 ? 0 : 2,
+			code: cur_solver.init(-1, 1) == 0 ? 0 : 2,
 			solver: cur_solver_name,
 			table_name: cur_solver.get_table_name(),
 			table_size: cur_solver.get_table_size()
@@ -107,7 +109,7 @@ function upload_table(e) {
 	}
 	const file = e.data;
 	if (file.size == Number(cur_solver.get_table_size())) {
-		const table_base = cur_solver._get_mem_ptr();
+		const table_base = Number(cur_solver._get_mem_ptr());
 		const reader = new FileReaderSync();
 		const chunkSize = 64 * 1024 * 1024;
 		for (let start = 0; start < file.size; start += chunkSize) {
@@ -117,7 +119,7 @@ function upload_table(e) {
 			cur_solver.HEAPU8.set(data, table_base + start);
 			postMessage({ code: -2, data: (start + data.length) / file.size });
 		}
-		if (cur_solver.init(0) == 1) {
+		if (cur_solver.init(0, navigator.hardwareConcurrency) == 1) {
 			self.postMessage(Object.assign({}, e, { code: 2 }));
 		}
 		self.postMessage(Object.assign({}, e, { code: 0 }));

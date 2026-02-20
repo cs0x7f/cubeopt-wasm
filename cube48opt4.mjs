@@ -805,7 +805,7 @@ var PThread = {
     }
   },
   initMainThread() {
-    var pthreadPoolSize = navigator.hardwareConcurrency + 2;
+    var pthreadPoolSize = navigator.hardwareConcurrency + 1;
     // Start loading up the Worker pool, if requested.
     while (pthreadPoolSize--) {
       PThread.allocateUnusedWorker();

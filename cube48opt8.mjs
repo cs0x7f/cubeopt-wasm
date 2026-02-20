@@ -425,14 +425,15 @@ function initMemory() {
   } else {
     var INITIAL_MEMORY = Module["INITIAL_MEMORY"] || 16777216;
     /** @suppress {checkTypes} */ wasmMemory = new WebAssembly.Memory({
-      "initial": INITIAL_MEMORY / 65536,
+      "initial": BigInt(INITIAL_MEMORY / 65536),
       // In theory we should not need to emit the maximum if we want "unlimited"
       // or 4GB of memory, but VMs error on that atm, see
       // https://github.com/emscripten-core/emscripten/issues/14130
       // And in the pthreads case we definitely need to emit a maximum. So
       // always emit one.
-      "maximum": 65536,
-      "shared": true
+      "maximum": 262144n,
+      "shared": true,
+      "address": "i64"
     });
   }
   updateMemoryViews();
@@ -512,10 +513,10 @@ var wasmBinaryFile;
 
 function findWasmBinary() {
   if (Module["locateFile"]) {
-    return locateFile("cube48opt2.wasm");
+    return locateFile("cube48opt8.wasm");
   }
   // Use bundler-friendly `new URL(..., import.meta.url)` pattern; works in browsers too.
-  return new URL("cube48opt2.wasm", import.meta.url).href;
+  return new URL("cube48opt8.wasm", import.meta.url).href;
 }
 
 function getBinarySync(file) {
@@ -745,16 +746,16 @@ var stackAlloc = sz => __emscripten_stack_alloc(sz);
   var bufSize = 8 * callArgs.length * 2;
   var sp = stackSave();
   var args = stackAlloc(bufSize);
-  var b = ((args) >>> 3);
+  var b = ((args) / 8);
   for (var arg of callArgs) {
     if (typeof arg == "bigint") {
       // The prefix is non-zero to indicate a bigint.
-      (growMemViews(), HEAP64)[b++ >>> 0] = 1n;
-      (growMemViews(), HEAP64)[b++ >>> 0] = arg;
+      (growMemViews(), HEAP64)[b++] = 1n;
+      (growMemViews(), HEAP64)[b++] = arg;
     } else {
       // The prefix is zero to indicate a JS Number.
-      (growMemViews(), HEAP64)[b++ >>> 0] = 0n;
-      (growMemViews(), HEAPF64)[b++ >>> 0] = arg;
+      (growMemViews(), HEAP64)[b++] = 0n;
+      (growMemViews(), HEAPF64)[b++] = arg;
     }
   }
   var rtn = __emscripten_run_js_on_main_thread(funcIndex, emAsmAddr, bufSize, args, proxyMode);
@@ -972,7 +973,7 @@ var PThread = {
     // the first case in their bundling step. The latter ends up producing an invalid
     // URL to import from the server (e.g., for webpack the file:// path).
     // See https://github.com/webpack/webpack/issues/12638
-    worker = new Worker(new URL("cube48opt2.mjs", import.meta.url), {
+    worker = new Worker(new URL("cube48opt8.mjs", import.meta.url), {
       "type": "module",
       // This is the way that we signal to the node worker that it is hosting
       // a pthread.
@@ -998,8 +999,8 @@ var onPostRuns = [];
 var addOnPostRun = cb => onPostRuns.push(cb);
 
 function establishStackSpace(pthread_ptr) {
-  var stackHigh = (growMemViews(), HEAPU32)[(((pthread_ptr) + (52)) >>> 2) >>> 0];
-  var stackSize = (growMemViews(), HEAPU32)[(((pthread_ptr) + (56)) >>> 2) >>> 0];
+  var stackHigh = Number((growMemViews(), HEAPU64)[(((pthread_ptr) + (88)) / 8)]);
+  var stackSize = Number((growMemViews(), HEAPU64)[(((pthread_ptr) + (96)) / 8)]);
   var stackLow = stackHigh - stackSize;
   // Set stack limits used by `emscripten/stack.h` function.  These limits are
   // cached in wasm-side globals to make checks as fast as possible.
@@ -1015,28 +1016,28 @@ function establishStackSpace(pthread_ptr) {
   if (type.endsWith("*")) type = "*";
   switch (type) {
    case "i1":
-    return (growMemViews(), HEAP8)[ptr >>> 0];
+    return (growMemViews(), HEAP8)[ptr];
 
    case "i8":
-    return (growMemViews(), HEAP8)[ptr >>> 0];
+    return (growMemViews(), HEAP8)[ptr];
 
    case "i16":
-    return (growMemViews(), HEAP16)[((ptr) >>> 1) >>> 0];
+    return (growMemViews(), HEAP16)[((ptr) / 2)];
 
    case "i32":
-    return (growMemViews(), HEAP32)[((ptr) >>> 2) >>> 0];
+    return (growMemViews(), HEAP32)[((ptr) / 4)];
 
    case "i64":
-    return (growMemViews(), HEAP64)[((ptr) >>> 3) >>> 0];
+    return (growMemViews(), HEAP64)[((ptr) / 8)];
 
    case "float":
-    return (growMemViews(), HEAPF32)[((ptr) >>> 2) >>> 0];
+    return (growMemViews(), HEAPF32)[((ptr) / 4)];
 
    case "double":
-    return (growMemViews(), HEAPF64)[((ptr) >>> 3) >>> 0];
+    return (growMemViews(), HEAPF64)[((ptr) / 8)];
 
    case "*":
-    return (growMemViews(), HEAPU32)[((ptr) >>> 2) >>> 0];
+    return Number((growMemViews(), HEAPU64)[((ptr) / 8)]);
 
    default:
     abort(`invalid type for getValue: ${type}`);
@@ -1046,9 +1047,13 @@ function establishStackSpace(pthread_ptr) {
 var wasmTableMirror = [];
 
 var getWasmTableEntry = funcPtr => {
+  // Function pointers should show up as numbers, even under wasm64, but
+  // we still have some places where bigint values can flow here.
+  // https://github.com/emscripten-core/emscripten/issues/18200
+  funcPtr = Number(funcPtr);
   var func = wasmTableMirror[funcPtr];
   if (!func) {
-    /** @suppress {checkTypes} */ wasmTableMirror[funcPtr] = func = wasmTable.get(funcPtr);
+    /** @suppress {checkTypes} */ wasmTableMirror[funcPtr] = func = wasmTable.get(BigInt(funcPtr));
   }
   return func;
 };
@@ -1074,7 +1079,7 @@ var invokeEntryPoint = (ptr, arg) => {
   // *ThreadMain(void *arg) form, or try linking with the Emscripten linker
   // flag -sEMULATE_FUNCTION_POINTER_CASTS to add in emulation for this x86
   // ABI extension.
-  var result = getWasmTableEntry(ptr)(arg);
+  var result = (a1 => getWasmTableEntry(ptr).call(null, BigInt(a1)))(arg);
   function finish(result) {
     // In MINIMAL_RUNTIME the noExitRuntime concept does not apply to
     // pthreads. To exit a pthread with live runtime, use the function
@@ -1100,35 +1105,35 @@ var registerTLSInit = tlsInitFunc => PThread.tlsInitFunctions.push(tlsInitFunc);
   if (type.endsWith("*")) type = "*";
   switch (type) {
    case "i1":
-    (growMemViews(), HEAP8)[ptr >>> 0] = value;
+    (growMemViews(), HEAP8)[ptr] = value;
     break;
 
    case "i8":
-    (growMemViews(), HEAP8)[ptr >>> 0] = value;
+    (growMemViews(), HEAP8)[ptr] = value;
     break;
 
    case "i16":
-    (growMemViews(), HEAP16)[((ptr) >>> 1) >>> 0] = value;
+    (growMemViews(), HEAP16)[((ptr) / 2)] = value;
     break;
 
    case "i32":
-    (growMemViews(), HEAP32)[((ptr) >>> 2) >>> 0] = value;
+    (growMemViews(), HEAP32)[((ptr) / 4)] = value;
     break;
 
    case "i64":
-    (growMemViews(), HEAP64)[((ptr) >>> 3) >>> 0] = BigInt(value);
+    (growMemViews(), HEAP64)[((ptr) / 8)] = BigInt(value);
     break;
 
    case "float":
-    (growMemViews(), HEAPF32)[((ptr) >>> 2) >>> 0] = value;
+    (growMemViews(), HEAPF32)[((ptr) / 4)] = value;
     break;
 
    case "double":
-    (growMemViews(), HEAPF64)[((ptr) >>> 3) >>> 0] = value;
+    (growMemViews(), HEAPF64)[((ptr) / 8)] = value;
     break;
 
    case "*":
-    (growMemViews(), HEAPU32)[((ptr) >>> 2) >>> 0] = value;
+    (growMemViews(), HEAPU64)[((ptr) / 8)] = BigInt(value);
     break;
 
    default:
@@ -1167,7 +1172,6 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
    * @param {boolean=} ignoreNul - If true, the function will not stop on a NUL character.
    * @return {string}
    */ var UTF8ArrayToString = (heapOrArray, idx = 0, maxBytesToRead, ignoreNul) => {
-  idx >>>= 0;
   var endPtr = findStringEnd(heapOrArray, idx, maxBytesToRead, ignoreNul);
   // When using conditional TextDecoder, skip it for short strings as the overhead of the native call is not worth it.
   if (endPtr - idx > 16 && heapOrArray.buffer && UTF8Decoder) {
@@ -1217,15 +1221,13 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
    *   string will cut short at that byte index.
    * @param {boolean=} ignoreNul - If true, the function will not stop on a NUL character.
    * @return {string}
-   */ var UTF8ToString = (ptr, maxBytesToRead, ignoreNul) => {
-  ptr >>>= 0;
-  return ptr ? UTF8ArrayToString((growMemViews(), HEAPU8), ptr, maxBytesToRead, ignoreNul) : "";
-};
+   */ var UTF8ToString = (ptr, maxBytesToRead, ignoreNul) => ptr ? UTF8ArrayToString((growMemViews(), 
+HEAPU8), ptr, maxBytesToRead, ignoreNul) : "";
 
 function ___assert_fail(condition, filename, line, func) {
-  condition >>>= 0;
-  filename >>>= 0;
-  func >>>= 0;
+  condition = bigintToI53Checked(condition);
+  filename = bigintToI53Checked(filename);
+  func = bigintToI53Checked(func);
   return abort(`Assertion failed: ${UTF8ToString(condition)}, at: ` + [ filename ? UTF8ToString(filename) : "unknown filename", line, func ? UTF8ToString(func) : "unknown function" ]);
 }
 
@@ -1233,33 +1235,33 @@ class ExceptionInfo {
   // excPtr - Thrown object pointer to wrap. Metadata pointer is calculated from it.
   constructor(excPtr) {
     this.excPtr = excPtr;
-    this.ptr = excPtr - 24;
+    this.ptr = excPtr - 48;
   }
   set_type(type) {
-    (growMemViews(), HEAPU32)[(((this.ptr) + (4)) >>> 2) >>> 0] = type;
+    (growMemViews(), HEAPU64)[(((this.ptr) + (8)) / 8)] = BigInt(type);
   }
   get_type() {
-    return (growMemViews(), HEAPU32)[(((this.ptr) + (4)) >>> 2) >>> 0];
+    return Number((growMemViews(), HEAPU64)[(((this.ptr) + (8)) / 8)]);
   }
   set_destructor(destructor) {
-    (growMemViews(), HEAPU32)[(((this.ptr) + (8)) >>> 2) >>> 0] = destructor;
+    (growMemViews(), HEAPU64)[(((this.ptr) + (16)) / 8)] = BigInt(destructor);
   }
   get_destructor() {
-    return (growMemViews(), HEAPU32)[(((this.ptr) + (8)) >>> 2) >>> 0];
+    return Number((growMemViews(), HEAPU64)[(((this.ptr) + (16)) / 8)]);
   }
   set_caught(caught) {
     caught = caught ? 1 : 0;
-    (growMemViews(), HEAP8)[(this.ptr) + (12) >>> 0] = caught;
+    (growMemViews(), HEAP8)[(this.ptr) + (24)] = caught;
   }
   get_caught() {
-    return (growMemViews(), HEAP8)[(this.ptr) + (12) >>> 0] != 0;
+    return (growMemViews(), HEAP8)[(this.ptr) + (24)] != 0;
   }
   set_rethrown(rethrown) {
     rethrown = rethrown ? 1 : 0;
-    (growMemViews(), HEAP8)[(this.ptr) + (13) >>> 0] = rethrown;
+    (growMemViews(), HEAP8)[(this.ptr) + (25)] = rethrown;
   }
   get_rethrown() {
-    return (growMemViews(), HEAP8)[(this.ptr) + (13) >>> 0] != 0;
+    return (growMemViews(), HEAP8)[(this.ptr) + (25)] != 0;
   }
   // Initialize native structure fields. Should be called once after allocated.
   init(type, destructor) {
@@ -1268,10 +1270,10 @@ class ExceptionInfo {
     this.set_destructor(destructor);
   }
   set_adjusted_ptr(adjustedPtr) {
-    (growMemViews(), HEAPU32)[(((this.ptr) + (16)) >>> 2) >>> 0] = adjustedPtr;
+    (growMemViews(), HEAPU64)[(((this.ptr) + (32)) / 8)] = BigInt(adjustedPtr);
   }
   get_adjusted_ptr() {
-    return (growMemViews(), HEAPU32)[(((this.ptr) + (16)) >>> 2) >>> 0];
+    return Number((growMemViews(), HEAPU64)[(((this.ptr) + (32)) / 8)]);
   }
 }
 
@@ -1280,9 +1282,9 @@ var exceptionLast = 0;
 var uncaughtExceptionCount = 0;
 
 function ___cxa_throw(ptr, type, destructor) {
-  ptr >>>= 0;
-  type >>>= 0;
-  destructor >>>= 0;
+  ptr = bigintToI53Checked(ptr);
+  type = bigintToI53Checked(type);
+  destructor = bigintToI53Checked(destructor);
   var info = new ExceptionInfo(ptr);
   // Initialize ExceptionInfo content after it was allocated in __cxa_allocate_exception.
   info.init(type, destructor);
@@ -1299,10 +1301,10 @@ function pthreadCreateProxied(pthread_ptr, attr, startRoutine, arg) {
 var _emscripten_has_threading_support = () => !!globalThis.SharedArrayBuffer;
 
 function ___pthread_create_js(pthread_ptr, attr, startRoutine, arg) {
-  pthread_ptr >>>= 0;
-  attr >>>= 0;
-  startRoutine >>>= 0;
-  arg >>>= 0;
+  pthread_ptr = bigintToI53Checked(pthread_ptr);
+  attr = bigintToI53Checked(attr);
+  startRoutine = bigintToI53Checked(startRoutine);
+  arg = bigintToI53Checked(arg);
   if (!_emscripten_has_threading_support()) {
     return 6;
   }
@@ -1339,14 +1341,18 @@ function ___pthread_create_js(pthread_ptr, attr, startRoutine, arg) {
   return spawnThread(threadParams);
 }
 
-var syscallGetVarargI = () => {
-  // the `+` prepended here is necessary to convince the JSCompiler that varargs is indeed a number.
-  var ret = (growMemViews(), HEAP32)[((+SYSCALLS.varargs) >>> 2) >>> 0];
-  SYSCALLS.varargs += 4;
+var syscallGetVarargP = () => {
+  var ret = Number((growMemViews(), HEAPU64)[((SYSCALLS.varargs) / 8)]);
+  SYSCALLS.varargs += 8;
   return ret;
 };
 
-var syscallGetVarargP = syscallGetVarargI;
+var syscallGetVarargI = () => {
+  // the `+` prepended here is necessary to convince the JSCompiler that varargs is indeed a number.
+  var ret = (growMemViews(), HEAP32)[((+SYSCALLS.varargs) / 4)];
+  SYSCALLS.varargs += 4;
+  return ret;
+};
 
 var PATH = {
   isAbs: path => path.charAt(0) === "/",
@@ -1406,16 +1412,7 @@ var PATH = {
   join2: (l, r) => PATH.normalize(l + "/" + r)
 };
 
-var initRandomFill = () => {
-  // This block is not needed on v19+ since crypto.getRandomValues is builtin
-  if (ENVIRONMENT_IS_NODE) {
-    var nodeCrypto = require("node:crypto");
-    return view => nodeCrypto.randomFillSync(view);
-  }
-  // like with most Web APIs, we can't use Web Crypto API directly on shared memory,
-  // so we need to create an intermediate buffer and copy it to the destination
-  return view => view.set(crypto.getRandomValues(new Uint8Array(view.byteLength)));
-};
+var initRandomFill = () => view => view.set(crypto.getRandomValues(new Uint8Array(view.byteLength)));
 
 var randomFill = view => {
   // Lazily init on the first invocation.
@@ -1501,7 +1498,6 @@ var lengthBytesUTF8 = str => {
 };
 
 var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
-  outIdx >>>= 0;
   // Parameter maxBytesToWrite is not optional. Negative values, 0, null,
   // undefined and false each don't write out any bytes.
   if (!(maxBytesToWrite > 0)) return 0;
@@ -1515,29 +1511,29 @@ var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
     var u = str.codePointAt(i);
     if (u <= 127) {
       if (outIdx >= endIdx) break;
-      heap[outIdx++ >>> 0] = u;
+      heap[outIdx++] = u;
     } else if (u <= 2047) {
       if (outIdx + 1 >= endIdx) break;
-      heap[outIdx++ >>> 0] = 192 | (u >> 6);
-      heap[outIdx++ >>> 0] = 128 | (u & 63);
+      heap[outIdx++] = 192 | (u >> 6);
+      heap[outIdx++] = 128 | (u & 63);
     } else if (u <= 65535) {
       if (outIdx + 2 >= endIdx) break;
-      heap[outIdx++ >>> 0] = 224 | (u >> 12);
-      heap[outIdx++ >>> 0] = 128 | ((u >> 6) & 63);
-      heap[outIdx++ >>> 0] = 128 | (u & 63);
+      heap[outIdx++] = 224 | (u >> 12);
+      heap[outIdx++] = 128 | ((u >> 6) & 63);
+      heap[outIdx++] = 128 | (u & 63);
     } else {
       if (outIdx + 3 >= endIdx) break;
-      heap[outIdx++ >>> 0] = 240 | (u >> 18);
-      heap[outIdx++ >>> 0] = 128 | ((u >> 12) & 63);
-      heap[outIdx++ >>> 0] = 128 | ((u >> 6) & 63);
-      heap[outIdx++ >>> 0] = 128 | (u & 63);
+      heap[outIdx++] = 240 | (u >> 18);
+      heap[outIdx++] = 128 | ((u >> 12) & 63);
+      heap[outIdx++] = 128 | ((u >> 6) & 63);
+      heap[outIdx++] = 128 | (u & 63);
       // Gotcha: if codePoint is over 0xFFFF, it is represented as a surrogate pair in UTF-16.
       // We need to manually skip over the second code unit for correct iteration.
       i++;
     }
   }
   // Null-terminate the pointer to the buffer.
-  heap[outIdx >>> 0] = 0;
+  heap[outIdx] = 0;
   return outIdx - startIdx;
 };
 
@@ -2035,7 +2031,7 @@ var MEMFS = {
               contents = Array.prototype.slice.call(contents, position, position + length);
             }
           }
-          (growMemViews(), HEAP8).set(contents, ptr >>> 0);
+          (growMemViews(), HEAP8).set(contents, ptr);
         }
       }
       return {
@@ -3763,39 +3759,39 @@ var SYSCALLS = {
     return dir + "/" + path;
   },
   writeStat(buf, stat) {
-    (growMemViews(), HEAPU32)[((buf) >>> 2) >>> 0] = stat.dev;
-    (growMemViews(), HEAPU32)[(((buf) + (4)) >>> 2) >>> 0] = stat.mode;
-    (growMemViews(), HEAPU32)[(((buf) + (8)) >>> 2) >>> 0] = stat.nlink;
-    (growMemViews(), HEAPU32)[(((buf) + (12)) >>> 2) >>> 0] = stat.uid;
-    (growMemViews(), HEAPU32)[(((buf) + (16)) >>> 2) >>> 0] = stat.gid;
-    (growMemViews(), HEAPU32)[(((buf) + (20)) >>> 2) >>> 0] = stat.rdev;
-    (growMemViews(), HEAP64)[(((buf) + (24)) >>> 3) >>> 0] = BigInt(stat.size);
-    (growMemViews(), HEAP32)[(((buf) + (32)) >>> 2) >>> 0] = 4096;
-    (growMemViews(), HEAP32)[(((buf) + (36)) >>> 2) >>> 0] = stat.blocks;
+    (growMemViews(), HEAPU32)[((buf) / 4)] = stat.dev;
+    (growMemViews(), HEAPU32)[(((buf) + (4)) / 4)] = stat.mode;
+    (growMemViews(), HEAPU64)[(((buf) + (8)) / 8)] = BigInt(stat.nlink);
+    (growMemViews(), HEAPU32)[(((buf) + (16)) / 4)] = stat.uid;
+    (growMemViews(), HEAPU32)[(((buf) + (20)) / 4)] = stat.gid;
+    (growMemViews(), HEAPU32)[(((buf) + (24)) / 4)] = stat.rdev;
+    (growMemViews(), HEAP64)[(((buf) + (32)) / 8)] = BigInt(stat.size);
+    (growMemViews(), HEAP32)[(((buf) + (40)) / 4)] = 4096;
+    (growMemViews(), HEAP32)[(((buf) + (44)) / 4)] = stat.blocks;
     var atime = stat.atime.getTime();
     var mtime = stat.mtime.getTime();
     var ctime = stat.ctime.getTime();
-    (growMemViews(), HEAP64)[(((buf) + (40)) >>> 3) >>> 0] = BigInt(Math.floor(atime / 1e3));
-    (growMemViews(), HEAPU32)[(((buf) + (48)) >>> 2) >>> 0] = (atime % 1e3) * 1e3 * 1e3;
-    (growMemViews(), HEAP64)[(((buf) + (56)) >>> 3) >>> 0] = BigInt(Math.floor(mtime / 1e3));
-    (growMemViews(), HEAPU32)[(((buf) + (64)) >>> 2) >>> 0] = (mtime % 1e3) * 1e3 * 1e3;
-    (growMemViews(), HEAP64)[(((buf) + (72)) >>> 3) >>> 0] = BigInt(Math.floor(ctime / 1e3));
-    (growMemViews(), HEAPU32)[(((buf) + (80)) >>> 2) >>> 0] = (ctime % 1e3) * 1e3 * 1e3;
-    (growMemViews(), HEAP64)[(((buf) + (88)) >>> 3) >>> 0] = BigInt(stat.ino);
+    (growMemViews(), HEAP64)[(((buf) + (48)) / 8)] = BigInt(Math.floor(atime / 1e3));
+    (growMemViews(), HEAPU64)[(((buf) + (56)) / 8)] = BigInt((atime % 1e3) * 1e3 * 1e3);
+    (growMemViews(), HEAP64)[(((buf) + (64)) / 8)] = BigInt(Math.floor(mtime / 1e3));
+    (growMemViews(), HEAPU64)[(((buf) + (72)) / 8)] = BigInt((mtime % 1e3) * 1e3 * 1e3);
+    (growMemViews(), HEAP64)[(((buf) + (80)) / 8)] = BigInt(Math.floor(ctime / 1e3));
+    (growMemViews(), HEAPU64)[(((buf) + (88)) / 8)] = BigInt((ctime % 1e3) * 1e3 * 1e3);
+    (growMemViews(), HEAP64)[(((buf) + (96)) / 8)] = BigInt(stat.ino);
     return 0;
   },
   writeStatFs(buf, stats) {
-    (growMemViews(), HEAPU32)[(((buf) + (4)) >>> 2) >>> 0] = stats.bsize;
-    (growMemViews(), HEAPU32)[(((buf) + (60)) >>> 2) >>> 0] = stats.bsize;
-    (growMemViews(), HEAP64)[(((buf) + (8)) >>> 3) >>> 0] = BigInt(stats.blocks);
-    (growMemViews(), HEAP64)[(((buf) + (16)) >>> 3) >>> 0] = BigInt(stats.bfree);
-    (growMemViews(), HEAP64)[(((buf) + (24)) >>> 3) >>> 0] = BigInt(stats.bavail);
-    (growMemViews(), HEAP64)[(((buf) + (32)) >>> 3) >>> 0] = BigInt(stats.files);
-    (growMemViews(), HEAP64)[(((buf) + (40)) >>> 3) >>> 0] = BigInt(stats.ffree);
-    (growMemViews(), HEAPU32)[(((buf) + (48)) >>> 2) >>> 0] = stats.fsid;
-    (growMemViews(), HEAPU32)[(((buf) + (64)) >>> 2) >>> 0] = stats.flags;
+    (growMemViews(), HEAPU32)[(((buf) + (8)) / 4)] = stats.bsize;
+    (growMemViews(), HEAPU32)[(((buf) + (72)) / 4)] = stats.bsize;
+    (growMemViews(), HEAP64)[(((buf) + (16)) / 8)] = BigInt(stats.blocks);
+    (growMemViews(), HEAP64)[(((buf) + (24)) / 8)] = BigInt(stats.bfree);
+    (growMemViews(), HEAP64)[(((buf) + (32)) / 8)] = BigInt(stats.bavail);
+    (growMemViews(), HEAP64)[(((buf) + (40)) / 8)] = BigInt(stats.files);
+    (growMemViews(), HEAP64)[(((buf) + (48)) / 8)] = BigInt(stats.ffree);
+    (growMemViews(), HEAPU32)[(((buf) + (56)) / 4)] = stats.fsid;
+    (growMemViews(), HEAPU32)[(((buf) + (80)) / 4)] = stats.flags;
     // ST_NOSUID
-    (growMemViews(), HEAPU32)[(((buf) + (56)) >>> 2) >>> 0] = stats.namelen;
+    (growMemViews(), HEAPU32)[(((buf) + (64)) / 4)] = stats.namelen;
   },
   doMsync(addr, stream, len, flags, offset) {
     if (!FS.isFile(stream.node.mode)) {
@@ -3821,7 +3817,7 @@ var SYSCALLS = {
 
 function ___syscall_fcntl64(fd, cmd, varargs) {
   if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(3, 0, 1, fd, cmd, varargs);
-  varargs >>>= 0;
+  varargs = bigintToI53Checked(varargs);
   SYSCALLS.varargs = varargs;
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
@@ -3855,17 +3851,17 @@ function ___syscall_fcntl64(fd, cmd, varargs) {
         return 0;
       }
 
-     case 12:
+     case 5:
       {
         var arg = syscallGetVarargP();
         var offset = 0;
         // We're always unlocked.
-        (growMemViews(), HEAP16)[(((arg) + (offset)) >>> 1) >>> 0] = 2;
+        (growMemViews(), HEAP16)[(((arg) + (offset)) / 2)] = 2;
         return 0;
       }
 
-     case 13:
-     case 14:
+     case 6:
+     case 7:
       // Pretend that the locking is successful. These are process-level locks,
       // and Emscripten programs are a single process. If we supported linking a
       // filesystem between programs, we'd need to do more here.
@@ -3881,7 +3877,7 @@ function ___syscall_fcntl64(fd, cmd, varargs) {
 
 function ___syscall_ioctl(fd, op, varargs) {
   if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(4, 0, 1, fd, op, varargs);
-  varargs >>>= 0;
+  varargs = bigintToI53Checked(varargs);
   SYSCALLS.varargs = varargs;
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
@@ -3898,12 +3894,12 @@ function ___syscall_ioctl(fd, op, varargs) {
         if (stream.tty.ops.ioctl_tcgets) {
           var termios = stream.tty.ops.ioctl_tcgets(stream);
           var argp = syscallGetVarargP();
-          (growMemViews(), HEAP32)[((argp) >>> 2) >>> 0] = termios.c_iflag || 0;
-          (growMemViews(), HEAP32)[(((argp) + (4)) >>> 2) >>> 0] = termios.c_oflag || 0;
-          (growMemViews(), HEAP32)[(((argp) + (8)) >>> 2) >>> 0] = termios.c_cflag || 0;
-          (growMemViews(), HEAP32)[(((argp) + (12)) >>> 2) >>> 0] = termios.c_lflag || 0;
+          (growMemViews(), HEAP32)[((argp) / 4)] = termios.c_iflag || 0;
+          (growMemViews(), HEAP32)[(((argp) + (4)) / 4)] = termios.c_oflag || 0;
+          (growMemViews(), HEAP32)[(((argp) + (8)) / 4)] = termios.c_cflag || 0;
+          (growMemViews(), HEAP32)[(((argp) + (12)) / 4)] = termios.c_lflag || 0;
           for (var i = 0; i < 32; i++) {
-            (growMemViews(), HEAP8)[(argp + i) + (17) >>> 0] = termios.c_cc[i] || 0;
+            (growMemViews(), HEAP8)[(argp + i) + (17)] = termios.c_cc[i] || 0;
           }
           return 0;
         }
@@ -3925,13 +3921,13 @@ function ___syscall_ioctl(fd, op, varargs) {
         if (!stream.tty) return -59;
         if (stream.tty.ops.ioctl_tcsets) {
           var argp = syscallGetVarargP();
-          var c_iflag = (growMemViews(), HEAP32)[((argp) >>> 2) >>> 0];
-          var c_oflag = (growMemViews(), HEAP32)[(((argp) + (4)) >>> 2) >>> 0];
-          var c_cflag = (growMemViews(), HEAP32)[(((argp) + (8)) >>> 2) >>> 0];
-          var c_lflag = (growMemViews(), HEAP32)[(((argp) + (12)) >>> 2) >>> 0];
+          var c_iflag = (growMemViews(), HEAP32)[((argp) / 4)];
+          var c_oflag = (growMemViews(), HEAP32)[(((argp) + (4)) / 4)];
+          var c_cflag = (growMemViews(), HEAP32)[(((argp) + (8)) / 4)];
+          var c_lflag = (growMemViews(), HEAP32)[(((argp) + (12)) / 4)];
           var c_cc = [];
           for (var i = 0; i < 32; i++) {
-            c_cc.push((growMemViews(), HEAP8)[(argp + i) + (17) >>> 0]);
+            c_cc.push((growMemViews(), HEAP8)[(argp + i) + (17)]);
           }
           return stream.tty.ops.ioctl_tcsets(stream.tty, op, {
             c_iflag,
@@ -3948,7 +3944,7 @@ function ___syscall_ioctl(fd, op, varargs) {
       {
         if (!stream.tty) return -59;
         var argp = syscallGetVarargP();
-        (growMemViews(), HEAP32)[((argp) >>> 2) >>> 0] = 0;
+        (growMemViews(), HEAP32)[((argp) / 4)] = 0;
         return 0;
       }
 
@@ -3973,8 +3969,8 @@ function ___syscall_ioctl(fd, op, varargs) {
         if (stream.tty.ops.ioctl_tiocgwinsz) {
           var winsize = stream.tty.ops.ioctl_tiocgwinsz(stream.tty);
           var argp = syscallGetVarargP();
-          (growMemViews(), HEAP16)[((argp) >>> 1) >>> 0] = winsize[0];
-          (growMemViews(), HEAP16)[(((argp) + (2)) >>> 1) >>> 0] = winsize[1];
+          (growMemViews(), HEAP16)[((argp) / 2)] = winsize[0];
+          (growMemViews(), HEAP16)[(((argp) + (2)) / 2)] = winsize[1];
         }
         return 0;
       }
@@ -4005,8 +4001,8 @@ function ___syscall_ioctl(fd, op, varargs) {
 
 function ___syscall_openat(dirfd, path, flags, varargs) {
   if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(5, 0, 1, dirfd, path, flags, varargs);
-  path >>>= 0;
-  varargs >>>= 0;
+  path = bigintToI53Checked(path);
+  varargs = bigintToI53Checked(varargs);
   SYSCALLS.varargs = varargs;
   try {
     path = SYSCALLS.getStr(path);
@@ -4022,10 +4018,9 @@ function ___syscall_openat(dirfd, path, flags, varargs) {
 var __abort_js = () => abort("");
 
 var AsciiToString = ptr => {
-  ptr >>>= 0;
   var str = "";
   while (1) {
-    var ch = (growMemViews(), HEAPU8)[ptr++ >>> 0];
+    var ch = (growMemViews(), HEAPU8)[ptr++];
     if (!ch) return str;
     str += String.fromCharCode(ch);
   }
@@ -4077,20 +4072,20 @@ var integerReadValueFromPointer = (name, width, signed) => {
   // integers are quite common, so generate very specialized functions
   switch (width) {
    case 1:
-    return signed ? pointer => (growMemViews(), HEAP8)[pointer >>> 0] : pointer => (growMemViews(), 
-    HEAPU8)[pointer >>> 0];
+    return signed ? pointer => (growMemViews(), HEAP8)[pointer] : pointer => (growMemViews(), 
+    HEAPU8)[pointer];
 
    case 2:
-    return signed ? pointer => (growMemViews(), HEAP16)[((pointer) >>> 1) >>> 0] : pointer => (growMemViews(), 
-    HEAPU16)[((pointer) >>> 1) >>> 0];
+    return signed ? pointer => (growMemViews(), HEAP16)[((pointer) / 2)] : pointer => (growMemViews(), 
+    HEAPU16)[((pointer) / 2)];
 
    case 4:
-    return signed ? pointer => (growMemViews(), HEAP32)[((pointer) >>> 2) >>> 0] : pointer => (growMemViews(), 
-    HEAPU32)[((pointer) >>> 2) >>> 0];
+    return signed ? pointer => (growMemViews(), HEAP32)[((pointer) / 4)] : pointer => (growMemViews(), 
+    HEAPU32)[((pointer) / 4)];
 
    case 8:
-    return signed ? pointer => (growMemViews(), HEAP64)[((pointer) >>> 3) >>> 0] : pointer => (growMemViews(), 
-    HEAPU64)[((pointer) >>> 3) >>> 0];
+    return signed ? pointer => (growMemViews(), HEAP64)[((pointer) / 8)] : pointer => (growMemViews(), 
+    HEAPU64)[((pointer) / 8)];
 
    default:
     throw new TypeError(`invalid integer width (${width}): ${name}`);
@@ -4098,16 +4093,23 @@ var integerReadValueFromPointer = (name, width, signed) => {
 };
 
 /** @suppress {globalThis} */ var __embind_register_bigint = function(primitiveType, name, size, minRange, maxRange) {
-  primitiveType >>>= 0;
-  name >>>= 0;
-  size >>>= 0;
+  primitiveType = bigintToI53Checked(primitiveType);
+  name = bigintToI53Checked(name);
+  size = bigintToI53Checked(size);
   name = AsciiToString(name);
   const isUnsignedType = minRange === 0n;
   let fromWireType = value => value;
   if (isUnsignedType) {
     // uint64 get converted to int64 in ABI, fix them up like we do for 32-bit integers.
     const bitSize = size * 8;
-    fromWireType = value => BigInt.asUintN(bitSize, value);
+    fromWireType = value => {
+      // FIXME(https://github.com/emscripten-core/emscripten/issues/16975)
+      // `size_t` ends up here, but it's transferred in the ABI as a plain number instead of a bigint.
+      if (typeof value == "number") {
+        return value >>> 0;
+      }
+      return BigInt.asUintN(bitSize, value);
+    };
     maxRange = fromWireType(maxRange);
   }
   registerType(primitiveType, {
@@ -4125,8 +4127,8 @@ var integerReadValueFromPointer = (name, width, signed) => {
 };
 
 /** @suppress {globalThis} */ function __embind_register_bool(rawType, name, trueValue, falseValue) {
-  rawType >>>= 0;
-  name >>>= 0;
+  rawType = bigintToI53Checked(rawType);
+  name = bigintToI53Checked(name);
   name = AsciiToString(name);
   registerType(rawType, {
     name,
@@ -4139,7 +4141,7 @@ var integerReadValueFromPointer = (name, width, signed) => {
       return o ? trueValue : falseValue;
     },
     readValueFromPointer: function(pointer) {
-      return this.fromWireType((growMemViews(), HEAPU8)[pointer >>> 0]);
+      return this.fromWireType((growMemViews(), HEAPU8)[pointer]);
     },
     destructorFunction: null
   });
@@ -4150,7 +4152,7 @@ var emval_freelist = [];
 var emval_handles = [ 0, 1, , 1, null, 1, true, 1, false, 1 ];
 
 function __emval_decref(handle) {
-  handle >>>= 0;
+  handle = bigintToI53Checked(handle);
   if (handle > 9 && 0 === --emval_handles[handle + 1]) {
     emval_handles[handle] = undefined;
     emval_freelist.push(handle);
@@ -4190,7 +4192,7 @@ var Emval = {
 };
 
 /** @suppress {globalThis} */ function readPointer(pointer) {
-  return this.fromWireType((growMemViews(), HEAPU32)[((pointer) >>> 2) >>> 0]);
+  return this.fromWireType(Number((growMemViews(), HEAPU64)[((pointer) / 8)]));
 }
 
 var EmValType = {
@@ -4206,7 +4208,7 @@ var EmValType = {
 };
 
 function __embind_register_emval(rawType) {
-  rawType >>>= 0;
+  rawType = bigintToI53Checked(rawType);
   return registerType(rawType, EmValType);
 }
 
@@ -4214,12 +4216,12 @@ var floatReadValueFromPointer = (name, width) => {
   switch (width) {
    case 4:
     return function(pointer) {
-      return this.fromWireType((growMemViews(), HEAPF32)[((pointer) >>> 2) >>> 0]);
+      return this.fromWireType((growMemViews(), HEAPF32)[((pointer) / 4)]);
     };
 
    case 8:
     return function(pointer) {
-      return this.fromWireType((growMemViews(), HEAPF64)[((pointer) >>> 3) >>> 0]);
+      return this.fromWireType((growMemViews(), HEAPF64)[((pointer) / 8)]);
     };
 
    default:
@@ -4228,9 +4230,9 @@ var floatReadValueFromPointer = (name, width) => {
 };
 
 var __embind_register_float = function(rawType, name, size) {
-  rawType >>>= 0;
-  name >>>= 0;
-  size >>>= 0;
+  rawType = bigintToI53Checked(rawType);
+  name = bigintToI53Checked(name);
+  size = bigintToI53Checked(size);
   name = AsciiToString(name);
   registerType(rawType, {
     name,
@@ -4401,7 +4403,7 @@ var heap32VectorToArray = (count, firstElement) => {
   for (var i = 0; i < count; i++) {
     // TODO(https://github.com/emscripten-core/emscripten/issues/17310):
     // Find a way to hoist the `>> 2` or `>> 3` out of this loop.
-    array.push((growMemViews(), HEAPU32)[(((firstElement) + (i * 4)) >>> 2) >>> 0]);
+    array.push(Number((growMemViews(), HEAPU64)[(((firstElement) + (i * 8)) / 8)]));
   }
   return array;
 };
@@ -4431,10 +4433,16 @@ var throwInternalError = message => {
 };
 
 var dynCall = (sig, ptr, args = [], promising = false) => {
+  // With MEMORY64 we have an additional step to convert `p` arguments to
+  // bigint. This is the runtime equivalent of the wrappers we create for wasm
+  // exports in `emscripten.py:create_wasm64_wrappers`.
+  for (var i = 1; i < sig.length; ++i) {
+    if (sig[i] == "p") args[i - 1] = BigInt(args[i - 1]);
+  }
   var func = getWasmTableEntry(ptr);
   var rtn = func(...args);
   function convert(rtn) {
-    return sig[0] == "p" ? rtn >>> 0 : rtn;
+    return sig[0] == "p" ? Number(rtn) : rtn;
   }
   return convert(rtn);
 };
@@ -4531,11 +4539,11 @@ var getFunctionName = signature => {
 };
 
 function __embind_register_function(name, argCount, rawArgTypesAddr, signature, rawInvoker, fn, isAsync, isNonnullReturn) {
-  name >>>= 0;
-  rawArgTypesAddr >>>= 0;
-  signature >>>= 0;
-  rawInvoker >>>= 0;
-  fn >>>= 0;
+  name = bigintToI53Checked(name);
+  rawArgTypesAddr = bigintToI53Checked(rawArgTypesAddr);
+  signature = bigintToI53Checked(signature);
+  rawInvoker = bigintToI53Checked(rawInvoker);
+  fn = bigintToI53Checked(fn);
   var argTypes = heap32VectorToArray(argCount, rawArgTypesAddr);
   name = AsciiToString(name);
   name = getFunctionName(name);
@@ -4551,9 +4559,9 @@ function __embind_register_function(name, argCount, rawArgTypesAddr, signature, 
 }
 
 /** @suppress {globalThis} */ var __embind_register_integer = function(primitiveType, name, size, minRange, maxRange) {
-  primitiveType >>>= 0;
-  name >>>= 0;
-  size >>>= 0;
+  primitiveType = bigintToI53Checked(primitiveType);
+  name = bigintToI53Checked(name);
+  size = bigintToI53Checked(size);
   name = AsciiToString(name);
   const isUnsignedType = minRange === 0;
   let fromWireType = value => value;
@@ -4572,13 +4580,13 @@ function __embind_register_function(name, argCount, rawArgTypesAddr, signature, 
 };
 
 function __embind_register_memory_view(rawType, dataTypeIndex, name) {
-  rawType >>>= 0;
-  name >>>= 0;
+  rawType = bigintToI53Checked(rawType);
+  name = bigintToI53Checked(name);
   var typeMapping = [ Int8Array, Uint8Array, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array ];
   var TA = typeMapping[dataTypeIndex];
   function decodeMemoryView(handle) {
-    var size = (growMemViews(), HEAPU32)[((handle) >>> 2) >>> 0];
-    var data = (growMemViews(), HEAPU32)[(((handle) + (4)) >>> 2) >>> 0];
+    var size = Number((growMemViews(), HEAPU64)[((handle) / 8)]);
+    var data = Number((growMemViews(), HEAPU64)[(((handle) + (8)) / 8)]);
     return new TA((growMemViews(), HEAP8).buffer, data, size);
   }
   name = AsciiToString(name);
@@ -4595,8 +4603,8 @@ var stringToUTF8 = (str, outPtr, maxBytesToWrite) => stringToUTF8Array(str, (gro
 HEAPU8), outPtr, maxBytesToWrite);
 
 function __embind_register_std_string(rawType, name) {
-  rawType >>>= 0;
-  name >>>= 0;
+  rawType = bigintToI53Checked(rawType);
+  name = bigintToI53Checked(name);
   name = AsciiToString(name);
   var stdStringIsUTF8 = true;
   registerType(rawType, {
@@ -4604,15 +4612,15 @@ function __embind_register_std_string(rawType, name) {
     // For some method names we use string keys here since they are part of
     // the public/external API and/or used by the runtime-generated code.
     fromWireType(value) {
-      var length = (growMemViews(), HEAPU32)[((value) >>> 2) >>> 0];
-      var payload = value + 4;
+      var length = Number((growMemViews(), HEAPU64)[((value) / 8)]);
+      var payload = value + 8;
       var str;
       if (stdStringIsUTF8) {
         str = UTF8ToString(payload, length, true);
       } else {
         str = "";
         for (var i = 0; i < length; ++i) {
-          str += String.fromCharCode((growMemViews(), HEAPU8)[payload + i >>> 0]);
+          str += String.fromCharCode((growMemViews(), HEAPU8)[payload + i]);
         }
       }
       _free(value);
@@ -4634,9 +4642,9 @@ function __embind_register_std_string(rawType, name) {
         length = value.length;
       }
       // assumes POINTER_SIZE alignment
-      var base = _malloc(4 + length + 1);
-      var ptr = base + 4;
-      (growMemViews(), HEAPU32)[((base) >>> 2) >>> 0] = length;
+      var base = _malloc(8 + length + 1);
+      var ptr = base + 8;
+      (growMemViews(), HEAPU64)[((base) / 8)] = BigInt(length);
       if (valueIsOfTypeString) {
         if (stdStringIsUTF8) {
           stringToUTF8(value, ptr, length + 1);
@@ -4647,11 +4655,11 @@ function __embind_register_std_string(rawType, name) {
               _free(base);
               throwBindingError("String has UTF-16 code units that do not fit in 8 bits");
             }
-            (growMemViews(), HEAPU8)[ptr + i >>> 0] = charCode;
+            (growMemViews(), HEAPU8)[ptr + i] = charCode;
           }
         }
       } else {
-        (growMemViews(), HEAPU8).set(value, ptr >>> 0);
+        (growMemViews(), HEAPU8).set(value, ptr);
       }
       if (destructors !== null) {
         destructors.push(_free, base);
@@ -4668,7 +4676,7 @@ function __embind_register_std_string(rawType, name) {
 var UTF16Decoder = globalThis.TextDecoder ? new TextDecoder("utf-16le") : undefined;
 
 var UTF16ToString = (ptr, maxBytesToRead, ignoreNul) => {
-  var idx = ((ptr) >>> 1);
+  var idx = ((ptr) / 2);
   var endIdx = findStringEnd((growMemViews(), HEAPU16), idx, maxBytesToRead / 2, ignoreNul);
   // When using conditional TextDecoder, skip it for short strings as the overhead of the native call is not worth it.
   if (endIdx - idx > 16 && UTF16Decoder) return UTF16Decoder.decode((growMemViews(), 
@@ -4679,7 +4687,7 @@ var UTF16ToString = (ptr, maxBytesToRead, ignoreNul) => {
   // for-loop's condition will always evaluate to true. The loop is then
   // terminated on the first null char.
   for (var i = idx; i < endIdx; ++i) {
-    var codeUnit = (growMemViews(), HEAPU16)[i >>> 0];
+    var codeUnit = (growMemViews(), HEAPU16)[i];
     // fromCharCode constructs a character from a UTF-16 code unit, so we can
     // pass the UTF16 string right through.
     str += String.fromCharCode(codeUnit);
@@ -4699,11 +4707,11 @@ var stringToUTF16 = (str, outPtr, maxBytesToWrite) => {
     // charCodeAt returns a UTF-16 encoded code unit, so it can be directly written to the HEAP.
     var codeUnit = str.charCodeAt(i);
     // possibly a lead surrogate
-    (growMemViews(), HEAP16)[((outPtr) >>> 1) >>> 0] = codeUnit;
+    (growMemViews(), HEAP16)[((outPtr) / 2)] = codeUnit;
     outPtr += 2;
   }
   // Null-terminate the pointer to the HEAP.
-  (growMemViews(), HEAP16)[((outPtr) >>> 1) >>> 0] = 0;
+  (growMemViews(), HEAP16)[((outPtr) / 2)] = 0;
   return outPtr - startPtr;
 };
 
@@ -4711,11 +4719,11 @@ var lengthBytesUTF16 = str => str.length * 2;
 
 var UTF32ToString = (ptr, maxBytesToRead, ignoreNul) => {
   var str = "";
-  var startIdx = ((ptr) >>> 2);
+  var startIdx = ((ptr) / 4);
   // If maxBytesToRead is not passed explicitly, it will be undefined, and this
   // will always evaluate to true. This saves on code size.
   for (var i = 0; !(i >= maxBytesToRead / 4); i++) {
-    var utf32 = (growMemViews(), HEAPU32)[startIdx + i >>> 0];
+    var utf32 = (growMemViews(), HEAPU32)[startIdx + i];
     if (!utf32 && !ignoreNul) break;
     str += String.fromCodePoint(utf32);
   }
@@ -4723,7 +4731,6 @@ var UTF32ToString = (ptr, maxBytesToRead, ignoreNul) => {
 };
 
 var stringToUTF32 = (str, outPtr, maxBytesToWrite) => {
-  outPtr >>>= 0;
   // Backwards compatibility: if max bytes is not specified, assume unsafe unbounded write is allowed.
   maxBytesToWrite ??= 2147483647;
   if (maxBytesToWrite < 4) return 0;
@@ -4736,12 +4743,12 @@ var stringToUTF32 = (str, outPtr, maxBytesToWrite) => {
     if (codePoint > 65535) {
       i++;
     }
-    (growMemViews(), HEAP32)[((outPtr) >>> 2) >>> 0] = codePoint;
+    (growMemViews(), HEAP32)[((outPtr) / 4)] = codePoint;
     outPtr += 4;
     if (outPtr + 4 > endPtr) break;
   }
   // Null-terminate the pointer to the HEAP.
-  (growMemViews(), HEAP32)[((outPtr) >>> 2) >>> 0] = 0;
+  (growMemViews(), HEAP32)[((outPtr) / 4)] = 0;
   return outPtr - startPtr;
 };
 
@@ -4760,9 +4767,9 @@ var lengthBytesUTF32 = str => {
 };
 
 function __embind_register_std_wstring(rawType, charSize, name) {
-  rawType >>>= 0;
-  charSize >>>= 0;
-  name >>>= 0;
+  rawType = bigintToI53Checked(rawType);
+  charSize = bigintToI53Checked(charSize);
+  name = bigintToI53Checked(name);
   name = AsciiToString(name);
   var decodeString, encodeString, lengthBytesUTF;
   if (charSize === 2) {
@@ -4778,8 +4785,8 @@ function __embind_register_std_wstring(rawType, charSize, name) {
     name,
     fromWireType: value => {
       // Code mostly taken from _embind_register_std_string fromWireType
-      var length = (growMemViews(), HEAPU32)[((value) >>> 2) >>> 0];
-      var str = decodeString(value + 4, length * charSize, true);
+      var length = Number((growMemViews(), HEAPU64)[((value) / 8)]);
+      var str = decodeString(value + 8, length * charSize, true);
       _free(value);
       return str;
     },
@@ -4789,9 +4796,9 @@ function __embind_register_std_wstring(rawType, charSize, name) {
       }
       // assumes POINTER_SIZE alignment
       var length = lengthBytesUTF(value);
-      var ptr = _malloc(4 + length + charSize);
-      (growMemViews(), HEAPU32)[((ptr) >>> 2) >>> 0] = length / charSize;
-      encodeString(value, ptr + 4, length + charSize);
+      var ptr = _malloc(8 + length + charSize);
+      (growMemViews(), HEAPU64)[((ptr) / 8)] = BigInt(length / charSize);
+      encodeString(value, ptr + 8, length + charSize);
       if (destructors !== null) {
         destructors.push(_free, ptr);
       }
@@ -4805,8 +4812,8 @@ function __embind_register_std_wstring(rawType, charSize, name) {
 }
 
 var __embind_register_void = function(rawType, name) {
-  rawType >>>= 0;
-  name >>>= 0;
+  rawType = bigintToI53Checked(rawType);
+  name = bigintToI53Checked(name);
   name = AsciiToString(name);
   registerType(rawType, {
     isVoid: true,
@@ -4819,7 +4826,7 @@ var __embind_register_void = function(rawType, name) {
 };
 
 function __emscripten_init_main_thread_js(tb) {
-  tb >>>= 0;
+  tb = bigintToI53Checked(tb);
   // Pass the thread address to the native code where they are stored in wasm
   // globals which act as a form of TLS. Global constructors trying
   // to access this value will read the wrong value, but that is UB anyway.
@@ -4872,16 +4879,16 @@ var callUserCallback = func => {
 var waitAsyncPolyfilled = (!Atomics.waitAsync || globalThis.Deno || (globalThis.navigator?.userAgent && Number((navigator.userAgent.match(/Chrom(e|ium)\/([0-9]+)\./) || [])[2]) < 91));
 
 function __emscripten_thread_mailbox_await(pthread_ptr) {
-  pthread_ptr >>>= 0;
+  pthread_ptr = bigintToI53Checked(pthread_ptr);
   if (!waitAsyncPolyfilled) {
     // Wait on the pthread's initial self-pointer field because it is easy and
     // safe to access from sending threads that need to notify the waiting
     // thread.
     // TODO: How to make this work with wasm64?
-    var wait = Atomics.waitAsync((growMemViews(), HEAP32), ((pthread_ptr) >>> 2), pthread_ptr);
+    var wait = Atomics.waitAsync((growMemViews(), HEAP32), ((pthread_ptr) / 4), pthread_ptr);
     wait.value.then(checkMailbox);
-    var waitingAsync = pthread_ptr + 128;
-    Atomics.store((growMemViews(), HEAP32), ((waitingAsync) >>> 2), 1);
+    var waitingAsync = pthread_ptr + 228;
+    Atomics.store((growMemViews(), HEAP32), ((waitingAsync) / 4), 1);
   }
 }
 
@@ -4904,8 +4911,8 @@ var checkMailbox = () => callUserCallback(() => {
 });
 
 function __emscripten_notify_mailbox_postmessage(targetThread, currThreadId) {
-  targetThread >>>= 0;
-  currThreadId >>>= 0;
+  targetThread = bigintToI53Checked(targetThread);
+  currThreadId = bigintToI53Checked(currThreadId);
   if (targetThread == currThreadId) {
     setTimeout(checkMailbox);
   } else if (ENVIRONMENT_IS_PTHREAD) {
@@ -4927,26 +4934,26 @@ function __emscripten_notify_mailbox_postmessage(targetThread, currThreadId) {
 var proxiedJSCallArgs = [];
 
 function __emscripten_receive_on_main_thread_js(funcIndex, emAsmAddr, callingThread, bufSize, args, ctx, ctxArgs) {
-  emAsmAddr >>>= 0;
-  callingThread >>>= 0;
-  args >>>= 0;
-  ctx >>>= 0;
-  ctxArgs >>>= 0;
+  emAsmAddr = bigintToI53Checked(emAsmAddr);
+  callingThread = bigintToI53Checked(callingThread);
+  args = bigintToI53Checked(args);
+  ctx = bigintToI53Checked(ctx);
+  ctxArgs = bigintToI53Checked(ctxArgs);
   // Sometimes we need to backproxy events to the calling thread (e.g.
   // HTML5 DOM events handlers such as
   // emscripten_set_mousemove_callback()), so keep track in a globally
   // accessible variable about the thread that initiated the proxying.
   proxiedJSCallArgs.length = 0;
-  var b = ((args) >>> 3);
-  var end = ((args + bufSize) >>> 3);
+  var b = ((args) / 8);
+  var end = ((args + bufSize) / 8);
   while (b < end) {
     var arg;
-    if ((growMemViews(), HEAP64)[b++ >>> 0]) {
+    if ((growMemViews(), HEAP64)[b++]) {
       // It's a BigInt.
-      arg = (growMemViews(), HEAP64)[b++ >>> 0];
+      arg = (growMemViews(), HEAP64)[b++];
     } else {
       // It's a Number.
-      arg = (growMemViews(), HEAPF64)[b++ >>> 0];
+      arg = (growMemViews(), HEAPF64)[b++];
     }
     proxiedJSCallArgs.push(arg);
   }
@@ -4959,11 +4966,16 @@ function __emscripten_receive_on_main_thread_js(funcIndex, emAsmAddr, callingThr
     rtn.then(rtn => __emscripten_run_js_on_main_thread_done(ctx, ctxArgs, rtn));
     return;
   }
+  // In memory64 mode some proxied functions return bigint/pointer but
+  // our return type is i53/double.
+  if (typeof rtn == "bigint") {
+    rtn = bigintToI53Checked(rtn);
+  }
   return rtn;
 }
 
 function __emscripten_thread_cleanup(thread) {
-  thread >>>= 0;
+  thread = bigintToI53Checked(thread);
   // Called when a thread needs to be cleaned up so it can be reused.
   // A thread is considered reusable when it either returns from its
   // entry point, calls pthread_exit, or acts upon a cancellation.
@@ -4976,7 +4988,7 @@ function __emscripten_thread_cleanup(thread) {
 }
 
 function __emscripten_thread_set_strongref(thread) {
-  thread >>>= 0;
+  thread = bigintToI53Checked(thread);
   // Called when a thread needs to be strongly referenced.
   // Currently only used for:
   // - keeping the "main" thread alive in PROXY_TO_PTHREAD mode;
@@ -4997,7 +5009,7 @@ var checkWasiClock = clock_id => clock_id >= 0 && clock_id <= 3;
 
 function _clock_time_get(clk_id, ignored_precision, ptime) {
   ignored_precision = bigintToI53Checked(ignored_precision);
-  ptime >>>= 0;
+  ptime = bigintToI53Checked(ptime);
   if (!checkWasiClock(clk_id)) {
     return 28;
   }
@@ -5012,7 +5024,7 @@ function _clock_time_get(clk_id, ignored_precision, ptime) {
   }
   // "now" is in ms, and wasi times are in ns.
   var nsec = Math.round(now * 1e3 * 1e3);
-  (growMemViews(), HEAP64)[((ptime) >>> 3) >>> 0] = BigInt(nsec);
+  (growMemViews(), HEAP64)[((ptime) / 8)] = BigInt(nsec);
   return 0;
 }
 
@@ -5027,11 +5039,7 @@ var _emscripten_exit_with_live_runtime = () => {
   throw "unwind";
 };
 
-var getHeapMax = () => // Stay one Wasm page short of 4GB: while e.g. Chrome is able to allocate
-// full 4GB Wasm memories, the size will wrap back to 0 bytes in Wasm side
-// for any code that deals with heap sizes, which would require special
-// casing all heap size related code to treat 0 specially.
-4294901760;
+var getHeapMax = () => 17179869184;
 
 var alignMemory = (size, alignment) => Math.ceil(size / alignment) * alignment;
 
@@ -5040,7 +5048,7 @@ var growMemory = size => {
   var pages = ((size - oldHeapSize + 65535) / 65536) | 0;
   try {
     // round size grow request up to wasm page size (fixed 64KB per spec)
-    wasmMemory.grow(pages);
+    wasmMemory.grow(BigInt(pages));
     // .grow() takes a delta compared to the previous size
     updateMemoryViews();
     return 1;
@@ -5048,7 +5056,7 @@ var growMemory = size => {
 };
 
 function _emscripten_resize_heap(requestedSize) {
-  requestedSize >>>= 0;
+  requestedSize = bigintToI53Checked(requestedSize);
   var oldSize = (growMemViews(), HEAPU8).length;
   // With multithreaded builds, races can happen (another thread might increase the size
   // in between), so return a failure, and let the caller retry.
@@ -5109,9 +5117,9 @@ function _fd_close(fd) {
 /** @param {number=} offset */ var doReadv = (stream, iov, iovcnt, offset) => {
   var ret = 0;
   for (var i = 0; i < iovcnt; i++) {
-    var ptr = (growMemViews(), HEAPU32)[((iov) >>> 2) >>> 0];
-    var len = (growMemViews(), HEAPU32)[(((iov) + (4)) >>> 2) >>> 0];
-    iov += 8;
+    var ptr = Number((growMemViews(), HEAPU64)[((iov) / 8)]);
+    var len = Number((growMemViews(), HEAPU64)[(((iov) + (8)) / 8)]);
+    iov += 16;
     var curr = FS.read(stream, (growMemViews(), HEAP8), ptr, len, offset);
     if (curr < 0) return -1;
     ret += curr;
@@ -5126,13 +5134,13 @@ function _fd_close(fd) {
 
 function _fd_read(fd, iov, iovcnt, pnum) {
   if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(7, 0, 1, fd, iov, iovcnt, pnum);
-  iov >>>= 0;
-  iovcnt >>>= 0;
-  pnum >>>= 0;
+  iov = bigintToI53Checked(iov);
+  iovcnt = bigintToI53Checked(iovcnt);
+  pnum = bigintToI53Checked(pnum);
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
     var num = doReadv(stream, iov, iovcnt);
-    (growMemViews(), HEAPU32)[((pnum) >>> 2) >>> 0] = num;
+    (growMemViews(), HEAPU64)[((pnum) / 8)] = BigInt(num);
     return 0;
   } catch (e) {
     if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
@@ -5143,12 +5151,12 @@ function _fd_read(fd, iov, iovcnt, pnum) {
 function _fd_seek(fd, offset, whence, newOffset) {
   if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(8, 0, 1, fd, offset, whence, newOffset);
   offset = bigintToI53Checked(offset);
-  newOffset >>>= 0;
+  newOffset = bigintToI53Checked(newOffset);
   try {
     if (isNaN(offset)) return 61;
     var stream = SYSCALLS.getStreamFromFD(fd);
     FS.llseek(stream, offset, whence);
-    (growMemViews(), HEAP64)[((newOffset) >>> 3) >>> 0] = BigInt(stream.position);
+    (growMemViews(), HEAP64)[((newOffset) / 8)] = BigInt(stream.position);
     if (stream.getdents && offset === 0 && whence === 0) stream.getdents = null;
     // reset readdir state
     return 0;
@@ -5161,9 +5169,9 @@ function _fd_seek(fd, offset, whence, newOffset) {
 /** @param {number=} offset */ var doWritev = (stream, iov, iovcnt, offset) => {
   var ret = 0;
   for (var i = 0; i < iovcnt; i++) {
-    var ptr = (growMemViews(), HEAPU32)[((iov) >>> 2) >>> 0];
-    var len = (growMemViews(), HEAPU32)[(((iov) + (4)) >>> 2) >>> 0];
-    iov += 8;
+    var ptr = Number((growMemViews(), HEAPU64)[((iov) / 8)]);
+    var len = Number((growMemViews(), HEAPU64)[(((iov) + (8)) / 8)]);
+    iov += 16;
     var curr = FS.write(stream, (growMemViews(), HEAP8), ptr, len, offset);
     if (curr < 0) return -1;
     ret += curr;
@@ -5180,13 +5188,13 @@ function _fd_seek(fd, offset, whence, newOffset) {
 
 function _fd_write(fd, iov, iovcnt, pnum) {
   if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(9, 0, 1, fd, iov, iovcnt, pnum);
-  iov >>>= 0;
-  iovcnt >>>= 0;
-  pnum >>>= 0;
+  iov = bigintToI53Checked(iov);
+  iovcnt = bigintToI53Checked(iovcnt);
+  pnum = bigintToI53Checked(pnum);
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
     var num = doWritev(stream, iov, iovcnt);
-    (growMemViews(), HEAPU32)[((pnum) >>> 2) >>> 0] = num;
+    (growMemViews(), HEAPU64)[((pnum) / 8)] = BigInt(num);
     return 0;
   } catch (e) {
     if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
@@ -5310,11 +5318,24 @@ function assignWasmImports() {
 function applySignatureConversions(wasmExports) {
   // First, make a copy of the incoming exports object
   wasmExports = Object.assign({}, wasmExports);
-  var makeWrapper_pp = f => a0 => f(a0) >>> 0;
-  var makeWrapper_p = f => () => f() >>> 0;
+  var makeWrapper_pp = f => a0 => Number(f(BigInt(a0)));
+  var makeWrapper__p = f => a0 => f(BigInt(a0));
+  var makeWrapper_p = f => () => Number(f());
+  var makeWrapper__p_____ = f => (a0, a1, a2, a3, a4, a5) => f(BigInt(a0), a1, a2, a3, a4, a5);
+  var makeWrapper__pp_ = f => (a0, a1, a2) => f(BigInt(a0), BigInt(a1), a2);
+  var makeWrapper___p_p_ = f => (a0, a1, a2, a3, a4) => f(a0, BigInt(a1), a2, BigInt(a3), a4);
+  var makeWrapper__pp = f => (a0, a1) => f(BigInt(a0), BigInt(a1));
   wasmExports["__getTypeName"] = makeWrapper_pp(wasmExports["__getTypeName"]);
   wasmExports["malloc"] = makeWrapper_pp(wasmExports["malloc"]);
+  wasmExports["free"] = makeWrapper__p(wasmExports["free"]);
   wasmExports["pthread_self"] = makeWrapper_p(wasmExports["pthread_self"]);
+  wasmExports["_emscripten_thread_init"] = makeWrapper__p_____(wasmExports["_emscripten_thread_init"]);
+  wasmExports["_emscripten_run_js_on_main_thread_done"] = makeWrapper__pp_(wasmExports["_emscripten_run_js_on_main_thread_done"]);
+  wasmExports["_emscripten_run_js_on_main_thread"] = makeWrapper___p_p_(wasmExports["_emscripten_run_js_on_main_thread"]);
+  wasmExports["_emscripten_thread_free_data"] = makeWrapper__p(wasmExports["_emscripten_thread_free_data"]);
+  wasmExports["_emscripten_thread_exit"] = makeWrapper__p(wasmExports["_emscripten_thread_exit"]);
+  wasmExports["emscripten_stack_set_limits"] = makeWrapper__pp(wasmExports["emscripten_stack_set_limits"]);
+  wasmExports["_emscripten_stack_restore"] = makeWrapper__p(wasmExports["_emscripten_stack_restore"]);
   wasmExports["_emscripten_stack_alloc"] = makeWrapper_pp(wasmExports["_emscripten_stack_alloc"]);
   wasmExports["emscripten_stack_get_current"] = makeWrapper_p(wasmExports["emscripten_stack_get_current"]);
   return wasmExports;
